@@ -282,3 +282,26 @@ schedulingProfiles:
   - pluginRef: decode-filter
   - pluginRef: max-score-picker
 `
+
+// EPP configuration for running with Length Bucketing
+const lengthBucketingConfig = `apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: length-bucketing
+  parameters:
+    labelName: vllm-bucket
+    buckets:
+    - minTokens: 0
+      maxTokens: 50
+      labelValue: small
+    - minTokens: 50
+      maxTokens: 100000
+      labelValue: large
+- type: max-score-picker
+- type: single-profile-handler
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: length-bucketing
+  - pluginRef: max-score-picker
+`

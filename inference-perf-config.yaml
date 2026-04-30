@@ -1,0 +1,55 @@
+load:
+  type: constant
+  stages:
+  - rate: 10.0
+    duration: 300
+  - rate: 20.0
+    duration: 300
+  - rate: 30.0
+    duration: 300
+  - rate: 40.0
+    duration: 300
+  - rate: 50.0
+    duration: 300
+  num_workers: 1
+  worker_max_concurrency: 1000
+  worker_max_tcp_connections: 2500
+  request_timeout: 2400
+api:
+  type: completion
+  streaming: true
+server:
+  type: vllm
+  model_name: Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
+  base_url: http://localhost:8000
+  ignore_eos: true
+tokenizer:
+  pretrained_model_name_or_path: Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
+data:
+  type: random
+  input_distribution:
+    min: 200
+    max: 3000
+    mean: 800
+    std_dev: 400
+    total_count: 1000
+  output_distribution:
+    min: 50
+    max: 200
+    mean: 100
+    std_dev: 50
+    total_count: 1000
+report:
+  request_lifecycle:
+    summary: true
+    per_stage: true
+    per_request: true
+  goodput:
+    constraints:
+      ttft: 1.0
+      itl: 0.100
+    percentile: p90
+storage:
+  google_cloud_storage:
+    bucket_name: <bucket_name>
+    path: reports-{timestamp}

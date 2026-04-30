@@ -39,6 +39,14 @@ func createModelServersDecode(replicas int) []string {
 	})
 }
 
+func createModelServersBucketed(replicas int, bucket string) []string {
+	return createModelServersFromYaml("./yaml/vllm-sim-bucketed.yaml", map[string]string{
+		"${KV_CACHE_ENABLED}":   "false",
+		"${VLLM_REPLICA_COUNT}": strconv.Itoa(replicas),
+		"${BUCKET_LABEL}":       bucket,
+	})
+}
+
 func createModelServersDecodeKV(replicas int) []string {
 	return createModelServersFromYaml(simDeployment, map[string]string{
 		"${MODEL_NAME}":         kvModelName,

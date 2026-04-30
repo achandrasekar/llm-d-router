@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/metrics"
@@ -79,6 +80,38 @@ var _ = ginkgo.Describe("Run end to end tests", ginkgo.Ordered, func() {
 
 			testutils.DeleteObjects(testConfig, epp)
 			testutils.DeleteObjects(testConfig, modelServers)
+		})
+	})
+
+	ginkgo.When("Running Length Bucketing configuration", func() {
+		ginkgo.It("should route based on prompt length", func() {
+			infPoolObjects = createInferencePool(1, true)
+
+			smallModelServers := createModelServersBucketed(1, "small")
+			largeModelServers := createModelServersBucketed(1, "large")
+
+			epp := createEndPointPicker(lengthBucketingConfig)
+
+			smallPods := getPodNames(map[string]string{"vllm-bucket": "small"})
+			largePods := getPodNames(map[string]string{"vllm-bucket": "large"})
+
+			gomega.Expect(smallPods).Should(gomega.HaveLen(1))
+			gomega.Expect(largePods).Should(gomega.HaveLen(1))
+
+			// Short prompt (approx 28 tokens) -> should go to small bucket
+			nsHdr, podHdr, _ := runCompletion(simplePrompt, simModelName)
+			gomega.Expect(nsHdr).Should(gomega.Equal(nsName))
+			gomega.Expect(podHdr).Should(gomega.Equal(smallPods[0]))
+
+			// Long prompt (approx 75 tokens) -> should go to large bucket
+			longPrompt := strings.Repeat("a ", 150) // 150 words, approx 150 tokens
+			nsHdr, podHdr, _ = runCompletion(longPrompt, simModelName)
+			gomega.Expect(nsHdr).Should(gomega.Equal(nsName))
+			gomega.Expect(podHdr).Should(gomega.Equal(largePods[0]))
+
+			testutils.DeleteObjects(testConfig, epp)
+			testutils.DeleteObjects(testConfig, smallModelServers)
+			testutils.DeleteObjects(testConfig, largeModelServers)
 		})
 	})
 
