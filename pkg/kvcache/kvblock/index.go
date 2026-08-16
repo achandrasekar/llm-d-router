@@ -37,6 +37,9 @@ type IndexConfig struct {
 	// CostAwareMemoryConfig holds the configuration for the cost-aware memory index.
 	CostAwareMemoryConfig *CostAwareMemoryIndexConfig `json:"costAwareMemoryConfig"`
 
+	// RadixTrieConfig holds the configuration for the O(L) Radix Trie index.
+	RadixTrieConfig *RadixTrieIndexConfig `json:"radixTrieConfig"`
+
 	// EnableMetrics toggles whether admissions/evictions/hits/misses are
 	// recorded.
 	EnableMetrics bool `json:"enableMetrics"`
@@ -64,6 +67,11 @@ func NewIndex(ctx context.Context, cfg *IndexConfig) (Index, error) {
 	var err error
 
 	switch {
+	case cfg.RadixTrieConfig != nil:
+		idx, err = NewRadixTrieIndex(cfg.RadixTrieConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create radix trie index: %w", err)
+		}
 	case cfg.CostAwareMemoryConfig != nil:
 		idx, err = NewCostAwareMemoryIndex(cfg.CostAwareMemoryConfig)
 		if err != nil {
