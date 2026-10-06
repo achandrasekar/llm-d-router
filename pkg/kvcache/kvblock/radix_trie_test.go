@@ -19,6 +19,7 @@ package kvblock_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -313,6 +314,76 @@ func TestRadixTrieIndex_InlineToMapChildFanout(t *testing.T) {
 	assert.Empty(t, res)
 }
 
+func TestRadixTrieIndex_ConcurrentWalkAndSplit(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(t.Context())
+	idx, err := NewRadixTrieIndex(&RadixTrieIndexConfig{Size: 1 << 16, PodCacheSize: 64})
+	require.NoError(t, err)
+
+	baseChain := make([]BlockHash, 64)
+	for i := range baseChain {
+		baseChain[i] = BlockHash(1000 + i)
+	}
+	seedPod := PodEntry{PodIdentifier: "seed-pod", DeviceTier: "gpu"}
+	require.NoError(t, idx.Add(ctx, nil, baseChain, []PodEntry{seedPod}))
+
+	var wg sync.WaitGroup
+	// Concurrent writers that split baseChain at every possible offset, add branches, and evict/re-add.
+	for w := 0; w < 16; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			pod := PodEntry{PodIdentifier: fmt.Sprintf("worker-%d", worker), DeviceTier: "gpu"}
+			for iter := 0; iter < 40; iter++ {
+				splitPoint := (worker*3 + iter) % 60
+				if splitPoint < 1 {
+					splitPoint = 1
+				}
+				branch := make([]BlockHash, splitPoint+4)
+				copy(branch, baseChain[:splitPoint])
+				for j := 0; j < 4; j++ {
+					branch[splitPoint+j] = BlockHash(uint64(100000 + worker*1000 + iter*10 + j))
+				}
+				require.NoError(t, idx.Add(ctx, nil, branch, []PodEntry{pod}))
+				// Also lookup mid-chain key while other workers split
+				midKey := baseChain[splitPoint]
+				_, err := idx.Lookup(ctx, []BlockHash{midKey}, nil)
+				require.NoError(t, err)
+			}
+		}(w)
+	}
+
+	// Concurrent lock-free WalkKeys and Lookup readers over baseChain and mid-chain sub-slices.
+	for r := 0; r < 16; r++ {
+		wg.Add(1)
+		go func(reader int) {
+			defer wg.Done()
+			for iter := 0; iter < 80; iter++ {
+				start := (reader + iter) % 32
+				slice := baseChain[start:]
+				err := idx.WalkKeys(ctx, slice, func(_ int, found bool, entries []EntryRef) bool {
+					if found {
+						for _, e := range entries {
+							_ = e.PodIdentifier
+						}
+					}
+					return true
+				})
+				require.NoError(t, err)
+			}
+		}(r)
+	}
+
+	wg.Wait()
+
+	// Verify seedPod is still present across all 64 keys of baseChain after all splits.
+	visits := walkAll(t, idx, baseChain)
+	require.Len(t, visits, len(baseChain))
+	for i, v := range visits {
+		assert.True(t, v.found, "position %d should still be found", i)
+		assert.Contains(t, podEntries(v.entries), seedPod)
+	}
+}
+
 func BenchmarkRadixTrieVsInMemory(b *testing.B) {
 	ctx := context.Background()
 	numBlocks := 500 // 500 blocks x 16 tokens = 8,000 token prompt
@@ -484,4 +555,102 @@ func BenchmarkRadixTrieWalkKeysScale(b *testing.B) {
 			}
 		})
 	}
+}
+
+func populateRadixIndex(b *testing.B, numKeys, numPods int) (*RadixTrieIndex, []BlockHash) {
+	b.Helper()
+	idx, err := NewRadixTrieIndex(&RadixTrieIndexConfig{
+		Size:         1 << 20,
+		PodCacheSize: 128,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	keys := make([]BlockHash, numKeys)
+	for i := range keys {
+		keys[i] = BlockHash(uint64(i) + 1)
+	}
+	entries := make([]PodEntry, numPods)
+	for p := range entries {
+		entries[p] = PodEntry{
+			PodIdentifier: fmt.Sprintf("10.0.%d.%d:8000", p/256, p%256),
+			DeviceTier:    "gpu",
+		}
+	}
+	if err := idx.Add(context.Background(), nil, keys, entries); err != nil {
+		b.Fatal(err)
+	}
+	return idx, keys
+}
+
+func BenchmarkRadixTrieIndexAdd(b *testing.B) {
+	idx, _ := populateRadixIndex(b, 1<<16, 4)
+	entries := []PodEntry{{PodIdentifier: "10.0.0.1:8000", DeviceTier: "gpu"}}
+	engineKeys := make([]BlockHash, 64)
+	requestKeys := make([]BlockHash, 64)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		base := uint64(i)*64 + 1
+		for j := range engineKeys {
+			engineKeys[j] = BlockHash(base + uint64(j))
+			requestKeys[j] = BlockHash(base + uint64(j))
+		}
+		if err := idx.Add(ctx, engineKeys, requestKeys, entries); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRadixTrieIndexMixed(b *testing.B) {
+	const numKeys = 3750
+	idx, keys := populateRadixIndex(b, numKeys, 16)
+	ctx := context.Background()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	for w := 0; w < 4; w++ {
+		go func(w int) {
+			entries := []PodEntry{{PodIdentifier: fmt.Sprintf("10.1.0.%d:8000", w), DeviceTier: "gpu"}}
+			engineKeys := make([]BlockHash, 64)
+			requestKeys := make([]BlockHash, 64)
+			for i := uint64(0); ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				base := (uint64(w)<<32 | i*64) + 1 //#nosec G115 -- test data, w is a small worker index
+				for j := range engineKeys {
+					engineKeys[j] = BlockHash(base + uint64(j))
+					requestKeys[j] = BlockHash(base + uint64(j))
+				}
+				_ = idx.Add(ctx, engineKeys, requestKeys, entries)
+			}
+		}(w)
+	}
+
+	podSet := sets.New[string]()
+	b.Run("Lookup", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := idx.Lookup(ctx, keys, podSet); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("WalkKeys", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := idx.WalkKeys(ctx, keys, func(_ int, found bool, refs []EntryRef) bool {
+				return found && len(refs) > 0
+			}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

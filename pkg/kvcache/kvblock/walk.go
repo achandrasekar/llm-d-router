@@ -112,7 +112,7 @@ func (pc *PodCache) visitEntries(pos int, visit func(int, bool, []EntryRef) bool
 // and never reused, up to a fixed number of distinct strings. Callers hold mu
 // across a whole batch so a batch is assigned all or nothing.
 type interner struct {
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	ids   map[string]uint32
 	limit int
 }
@@ -154,6 +154,30 @@ func (in *interner) internLocked(s string) uint32 {
 // is assigned all or nothing: when its new pods or tiers would exceed a cap,
 // no ordinal is consumed and the error names the cap.
 func internEntryRecords(pods, tiers *interner, entries []PodEntry) ([]EntryRef, error) {
+	records := make([]EntryRef, len(entries))
+
+	pods.mu.RLock()
+	tiers.mu.RLock()
+	allFound := true
+	for i, entry := range entries {
+		podID, okPod := pods.ids[entry.PodIdentifier]
+		tierID, okTier := tiers.ids[entry.DeviceTier]
+		if !okPod || !okTier {
+			allFound = false
+			break
+		}
+		records[i] = EntryRef{
+			PodEntry:    entry,
+			PodOrdinal:  podID,
+			TierOrdinal: tierID,
+		}
+	}
+	tiers.mu.RUnlock()
+	pods.mu.RUnlock()
+	if allFound {
+		return records, nil
+	}
+
 	pods.mu.Lock()
 	defer pods.mu.Unlock()
 	tiers.mu.Lock()
@@ -174,7 +198,6 @@ func internEntryRecords(pods, tiers *interner, entries []PodEntry) ([]EntryRef, 
 		return nil, fmt.Errorf("%w: %d device tiers", errIndexCardinality, maxInternedTiers)
 	}
 
-	records := make([]EntryRef, len(entries))
 	for i, entry := range entries {
 		records[i] = EntryRef{
 			PodEntry:    entry,
