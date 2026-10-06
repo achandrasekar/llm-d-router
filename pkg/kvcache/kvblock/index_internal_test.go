@@ -17,11 +17,30 @@ limitations under the License.
 package kvblock
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDefaultIndexConfigUsesRadixTrie(t *testing.T) {
+	ctx := context.Background()
+
+	idx, err := NewIndex(ctx, nil)
+	require.NoError(t, err)
+	assert.IsType(t, &RadixTrieIndex{}, idx)
+
+	cfg := DefaultIndexConfig()
+	idx, err = NewIndex(ctx, cfg)
+	require.NoError(t, err)
+	assert.IsType(t, &RadixTrieIndex{}, idx)
+
+	cfg.InMemoryConfig = DefaultInMemoryIndexConfig()
+	idx, err = NewIndex(ctx, cfg)
+	require.NoError(t, err)
+	assert.IsType(t, &InMemoryIndex{}, idx)
+}
 
 func TestEngineToRequestMapping_OneToOne(t *testing.T) {
 	engineKeys := []BlockHash{100, 200, 300, 400}

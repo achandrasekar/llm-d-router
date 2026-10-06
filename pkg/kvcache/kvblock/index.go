@@ -52,8 +52,8 @@ type IndexConfig struct {
 // DefaultIndexConfig returns a default configuration for the KV-block index.
 func DefaultIndexConfig() *IndexConfig {
 	return &IndexConfig{
-		InMemoryConfig: DefaultInMemoryIndexConfig(),
-		EnableMetrics:  false,
+		RadixTrieConfig: DefaultRadixTrieIndexConfig(),
+		EnableMetrics:   false,
 	}
 }
 
@@ -67,11 +67,6 @@ func NewIndex(ctx context.Context, cfg *IndexConfig) (Index, error) {
 	var err error
 
 	switch {
-	case cfg.RadixTrieConfig != nil:
-		idx, err = NewRadixTrieIndex(cfg.RadixTrieConfig)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create radix trie index: %w", err)
-		}
 	case cfg.CostAwareMemoryConfig != nil:
 		idx, err = NewCostAwareMemoryIndex(cfg.CostAwareMemoryConfig)
 		if err != nil {
@@ -87,6 +82,11 @@ func NewIndex(ctx context.Context, cfg *IndexConfig) (Index, error) {
 		idx, err = NewInMemoryIndex(cfg.InMemoryConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create in-memory index: %w", err)
+		}
+	case cfg.RadixTrieConfig != nil:
+		idx, err = NewRadixTrieIndex(cfg.RadixTrieConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create radix trie index: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("no valid index configuration provided")
