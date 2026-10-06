@@ -19,11 +19,14 @@ package kvblock
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
+
+const inlineChildCapacity = 4
 
 // RadixTrieIndexConfig holds the configuration for RadixTrieIndex.
 type RadixTrieIndexConfig struct {
@@ -41,21 +44,176 @@ func DefaultRadixTrieIndexConfig() *RadixTrieIndexConfig {
 	}
 }
 
-// RadixNode represents a node in the KV-cache prefix Radix Trie.
-type RadixNode struct {
-	key      BlockHash
-	entries  []EntryRef
-	children map[BlockHash]*RadixNode
-	parent   *RadixNode
+type inlineChild struct {
+	key  BlockHash
+	node *RadixNode
 }
 
-// newRadixNode instantiates a new trie node.
-func newRadixNode(key BlockHash, parent *RadixNode) *RadixNode {
-	return &RadixNode{
-		key:      key,
-		children: make(map[BlockHash]*RadixNode),
-		parent:   parent,
+type nodeRef struct {
+	node   *RadixNode
+	offset int
+}
+
+// RadixNode represents a compressed edge node in the KV-cache prefix Radix Trie.
+// Unbranched sequences of request block keys are stored contiguously in edge.
+// When all keys along edge share the same pod entries, sharedEntries holds them
+// once for the entire edge and perOffsetEntries is nil.
+type RadixNode struct {
+	edge             []BlockHash
+	sharedEntries    []EntryRef
+	perOffsetEntries [][]EntryRef
+	inlineChildren   [inlineChildCapacity]inlineChild
+	numInline        uint8
+	children         map[BlockHash]*RadixNode
+	parent           *RadixNode
+}
+
+func newRootRadixNode() *RadixNode {
+	return &RadixNode{}
+}
+
+func (n *RadixNode) getChild(key BlockHash) *RadixNode {
+	for i := uint8(0); i < n.numInline; i++ {
+		if n.inlineChildren[i].key == key {
+			return n.inlineChildren[i].node
+		}
 	}
+	if n.children != nil {
+		return n.children[key]
+	}
+	return nil
+}
+
+func (n *RadixNode) setChild(key BlockHash, child *RadixNode) {
+	for i := uint8(0); i < n.numInline; i++ {
+		if n.inlineChildren[i].key == key {
+			n.inlineChildren[i].node = child
+			return
+		}
+	}
+	if n.children != nil {
+		n.children[key] = child
+		return
+	}
+	if int(n.numInline) < inlineChildCapacity {
+		n.inlineChildren[n.numInline] = inlineChild{key: key, node: child}
+		n.numInline++
+		return
+	}
+	n.children = make(map[BlockHash]*RadixNode, inlineChildCapacity+1)
+	for i := uint8(0); i < n.numInline; i++ {
+		n.children[n.inlineChildren[i].key] = n.inlineChildren[i].node
+		n.inlineChildren[i] = inlineChild{}
+	}
+	n.numInline = 0
+	n.children[key] = child
+}
+
+func (n *RadixNode) deleteChild(key BlockHash) {
+	for i := uint8(0); i < n.numInline; i++ {
+		if n.inlineChildren[i].key == key {
+			last := n.numInline - 1
+			n.inlineChildren[i] = n.inlineChildren[last]
+			n.inlineChildren[last] = inlineChild{}
+			n.numInline = last
+			return
+		}
+	}
+	if n.children != nil {
+		delete(n.children, key)
+	}
+}
+
+func (n *RadixNode) hasChildren() bool {
+	return n.numInline > 0 || len(n.children) > 0
+}
+
+func (n *RadixNode) entriesAt(offset int) []EntryRef {
+	if n.perOffsetEntries != nil {
+		return n.perOffsetEntries[offset]
+	}
+	return n.sharedEntries
+}
+
+func (n *RadixNode) ensurePerOffset() {
+	if n.perOffsetEntries != nil {
+		return
+	}
+	n.perOffsetEntries = make([][]EntryRef, len(n.edge))
+	for i := range n.edge {
+		if len(n.sharedEntries) > 0 {
+			n.perOffsetEntries[i] = slices.Clone(n.sharedEntries)
+		}
+	}
+	n.sharedEntries = nil
+}
+
+func (n *RadixNode) addRecordsFullEdge(recs []EntryRef, capacity int) {
+	if n.perOffsetEntries == nil {
+		n.sharedEntries = addEntryRefs(n.sharedEntries, recs, capacity)
+		return
+	}
+	for i := range n.perOffsetEntries {
+		n.perOffsetEntries[i] = addEntryRefs(n.perOffsetEntries[i], recs, capacity)
+	}
+}
+
+func (n *RadixNode) addRecordsRange(start, end int, recs []EntryRef, capacity int) {
+	if start == 0 && end == len(n.edge) {
+		n.addRecordsFullEdge(recs, capacity)
+		return
+	}
+	n.ensurePerOffset()
+	for i := start; i < end; i++ {
+		n.perOffsetEntries[i] = addEntryRefs(n.perOffsetEntries[i], recs, capacity)
+	}
+}
+
+func (n *RadixNode) removeRecordsAt(offset int, toRemove []PodEntry) {
+	if n.perOffsetEntries == nil {
+		if !hasAnyPodEntry(n.sharedEntries, toRemove) {
+			return
+		}
+		if len(n.edge) == 1 {
+			n.sharedEntries = removeEntryRefs(n.sharedEntries, toRemove)
+			return
+		}
+		n.ensurePerOffset()
+	}
+	n.perOffsetEntries[offset] = removeEntryRefs(n.perOffsetEntries[offset], toRemove)
+}
+
+func (n *RadixNode) removePodFromNode(podIdentifier string) {
+	if n.perOffsetEntries == nil {
+		n.sharedEntries = removePodEntryRefs(n.sharedEntries, podIdentifier)
+		return
+	}
+	for i := range n.perOffsetEntries {
+		n.perOffsetEntries[i] = removePodEntryRefs(n.perOffsetEntries[i], podIdentifier)
+	}
+}
+
+func (n *RadixNode) isEmpty() bool {
+	if n.perOffsetEntries == nil {
+		return len(n.sharedEntries) == 0
+	}
+	for _, entries := range n.perOffsetEntries {
+		if len(entries) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func hasAnyPodEntry(entries []EntryRef, targets []PodEntry) bool {
+	for i := range entries {
+		for j := range targets {
+			if entries[i].PodEntry == targets[j] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // addEntryRefs inserts records with LRU semantics bounded by capacity.
@@ -96,6 +254,19 @@ func removeEntryRefs(entries []EntryRef, toRemove []PodEntry) []EntryRef {
 	return entries
 }
 
+// removePodEntryRefs deletes all records belonging to podIdentifier.
+func removePodEntryRefs(entries []EntryRef, podIdentifier string) []EntryRef {
+	n := 0
+	for _, ref := range entries {
+		if ref.PodIdentifier != podIdentifier {
+			entries[n] = ref
+			n++
+		}
+	}
+	clear(entries[n:])
+	return entries[:n]
+}
+
 // filterEntryRefs returns the PodEntry slice matching allowed (all entries when allowed is empty).
 func filterEntryRefs(entries []EntryRef, allowed sets.Set[string]) []PodEntry {
 	if len(entries) == 0 {
@@ -117,11 +288,11 @@ func filterEntryRefs(entries []EntryRef, allowed sets.Set[string]) []PodEntry {
 	return matched
 }
 
-// RadixTrieIndex is an O(L) Radix-Trie based implementation of the Index interface.
+// RadixTrieIndex is a compressed Radix-Trie implementation of the Index and KeyWalker interfaces.
 type RadixTrieIndex struct {
 	mu                  sync.RWMutex
 	root                *RadixNode
-	nodeLookup          map[BlockHash]*RadixNode
+	nodeLookup          map[BlockHash]nodeRef
 	engineToRequestKeys *lru.Cache[BlockHash, []BlockHash]
 	podCacheSize        int
 	pods                *interner
@@ -153,8 +324,8 @@ func NewRadixTrieIndex(cfg *RadixTrieIndexConfig) (*RadixTrieIndex, error) {
 	}
 
 	return &RadixTrieIndex{
-		root:                newRadixNode(EmptyBlockHash, nil),
-		nodeLookup:          make(map[BlockHash]*RadixNode),
+		root:                newRootRadixNode(),
+		nodeLookup:          make(map[BlockHash]nodeRef),
 		engineToRequestKeys: engineToRequestKeys,
 		podCacheSize:        podCacheSize,
 		pods:                newInterner(maxInternedPods),
@@ -162,8 +333,8 @@ func NewRadixTrieIndex(cfg *RadixTrieIndexConfig) (*RadixTrieIndex, error) {
 	}, nil
 }
 
-// WalkKeys implements KeyWalker, visiting requestKeys in order without materializing
-// per-key PodEntry slices.
+// WalkKeys implements KeyWalker, traversing compressed edge slices in order without
+// materializing per-key PodEntry slices.
 func (r *RadixTrieIndex) WalkKeys(
 	ctx context.Context,
 	requestKeys []BlockHash,
@@ -172,35 +343,67 @@ func (r *RadixTrieIndex) WalkKeys(
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	curr := r.root
+	var node *RadixNode
+	offset := 0
+	parent := r.root
+
 	for pos, key := range requestKeys {
 		if pos&cancellationCheckMask == 0 && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		var node *RadixNode
-		if curr != nil {
-			node = curr.children[key]
+
+		if node != nil && offset < len(node.edge) && node.edge[offset] == key {
+			// Fast path: advance along the current compressed edge slice.
+		} else {
+			node = nil
+			if parent != nil {
+				if child := parent.getChild(key); child != nil {
+					node = child
+					offset = 0
+				}
+			}
+			if node == nil {
+				if ref, ok := r.nodeLookup[key]; ok {
+					node = ref.node
+					offset = ref.offset
+				}
+			}
 		}
+
 		if node == nil {
-			node = r.nodeLookup[key]
-		}
-		if node == nil || len(node.entries) == 0 {
-			curr = nil
+			parent = nil
 			if !visit(pos, false, nil) {
 				return ctx.Err()
 			}
 			continue
 		}
-		curr = node
-		if !visit(pos, true, node.entries) {
+
+		entries := node.entriesAt(offset)
+		if len(entries) == 0 {
+			node = nil
+			parent = nil
+			if !visit(pos, false, nil) {
+				return ctx.Err()
+			}
+			continue
+		}
+
+		if !visit(pos, true, entries) {
 			return ctx.Err()
 		}
+
+		offset++
+		if offset == len(node.edge) {
+			parent = node
+			node = nil
+		}
 	}
+
 	return ctx.Err()
 }
 
 // Lookup receives a list of requestKeys and a set of pod identifiers,
-// and retrieves the filtered pods associated with those keys by traversing the Radix Trie.
+// and retrieves the filtered pods associated with those keys by traversing the compressed Radix Trie.
 func (r *RadixTrieIndex) Lookup(
 	ctx context.Context,
 	requestKeys []BlockHash,
@@ -214,32 +417,58 @@ func (r *RadixTrieIndex) Lookup(
 	defer r.mu.RUnlock()
 
 	podsPerKey := make(map[BlockHash][]PodEntry)
-	curr := r.root
+	var node *RadixNode
+	offset := 0
+	parent := r.root
 
 	for idx, requestKey := range requestKeys {
 		if idx&cancellationCheckMask == 0 && ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 
-		child := curr.children[requestKey]
-		if child == nil {
-			if idx == 0 {
-				child = r.nodeLookup[requestKey]
-			} else {
-				child = r.root.children[requestKey]
+		if node != nil && offset < len(node.edge) && node.edge[offset] == requestKey {
+			// Fast path: contiguous compressed edge match.
+		} else {
+			node = nil
+			if parent != nil {
+				if child := parent.getChild(requestKey); child != nil {
+					node = child
+					offset = 0
+				}
+			}
+			if node == nil {
+				if idx == 0 {
+					if ref, ok := r.nodeLookup[requestKey]; ok {
+						node = ref.node
+						offset = ref.offset
+					}
+				} else if child := r.root.getChild(requestKey); child != nil {
+					node = child
+					offset = 0
+				}
 			}
 		}
-		if child == nil || len(child.entries) == 0 {
+
+		if node == nil {
 			break
 		}
 
-		matchedPods := filterEntryRefs(child.entries, podIdentifierSet)
+		entries := node.entriesAt(offset)
+		if len(entries) == 0 {
+			break
+		}
+
+		matchedPods := filterEntryRefs(entries, podIdentifierSet)
 		if len(matchedPods) == 0 {
 			break
 		}
 
 		podsPerKey[requestKey] = matchedPods
-		curr = child
+		offset++
+		if offset == len(node.edge) {
+			parent = node
+			node = nil
+		}
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -247,6 +476,43 @@ func (r *RadixTrieIndex) Lookup(
 	}
 
 	return podsPerKey, nil
+}
+
+// splitNode splits node at splitIdx (0 < splitIdx < len(node.edge)) and returns
+// the newly created prefix node covering node.edge[:splitIdx].
+func (r *RadixTrieIndex) splitNode(node *RadixNode, splitIdx int) *RadixNode {
+	parent := node.parent
+	prefixEdge := node.edge[:splitIdx:splitIdx]
+	suffixEdge := node.edge[splitIdx:]
+
+	prefixNode := &RadixNode{
+		edge:   prefixEdge,
+		parent: parent,
+	}
+
+	if node.perOffsetEntries == nil {
+		prefixNode.sharedEntries = slices.Clone(node.sharedEntries)
+	} else {
+		prefixNode.perOffsetEntries = node.perOffsetEntries[:splitIdx:splitIdx]
+		node.perOffsetEntries = node.perOffsetEntries[splitIdx:]
+	}
+
+	node.edge = suffixEdge
+	node.parent = prefixNode
+
+	if parent != nil {
+		parent.setChild(prefixEdge[0], prefixNode)
+	}
+	prefixNode.setChild(suffixEdge[0], node)
+
+	for i, k := range prefixEdge {
+		r.nodeLookup[k] = nodeRef{node: prefixNode, offset: i}
+	}
+	for i, k := range suffixEdge {
+		r.nodeLookup[k] = nodeRef{node: node, offset: i}
+	}
+
+	return prefixNode
 }
 
 // Add stores requestKey -> pod entries and (optionally) engineKey -> requestKey mappings in the Radix Trie.
@@ -275,20 +541,91 @@ func (r *RadixTrieIndex) Add(
 	}
 
 	curr := r.root
-	for _, requestKey := range requestKeys {
-		child, exists := curr.children[requestKey]
-		if !exists {
-			if existing, ok := r.nodeLookup[requestKey]; ok {
-				child = existing
-			} else {
-				child = newRadixNode(requestKey, curr)
-				curr.children[requestKey] = child
-				r.nodeLookup[requestKey] = child
+	pos := 0
+	for pos < len(requestKeys) {
+		key := requestKeys[pos]
+
+		if child := curr.getChild(key); child != nil {
+			matchLen := 1
+			maxMatch := min(len(child.edge), len(requestKeys)-pos)
+			for matchLen < maxMatch && child.edge[matchLen] == requestKeys[pos+matchLen] {
+				matchLen++
 			}
+
+			if matchLen == len(child.edge) {
+				child.addRecordsFullEdge(records, r.podCacheSize)
+				curr = child
+				pos += matchLen
+				continue
+			}
+
+			if pos+matchLen == len(requestKeys) {
+				child.addRecordsRange(0, matchLen, records, r.podCacheSize)
+				return nil
+			}
+
+			prefixNode := r.splitNode(child, matchLen)
+			prefixNode.addRecordsFullEdge(records, r.podCacheSize)
+			curr = prefixNode
+			pos += matchLen
+			continue
 		}
 
-		child.entries = addEntryRefs(child.entries, records, r.podCacheSize)
+		if ref, exists := r.nodeLookup[key]; exists {
+			node := ref.node
+			startOff := ref.offset
+			matchLen := 1
+			maxMatch := min(len(node.edge)-startOff, len(requestKeys)-pos)
+			for matchLen < maxMatch && node.edge[startOff+matchLen] == requestKeys[pos+matchLen] {
+				matchLen++
+			}
+
+			node.addRecordsRange(startOff, startOff+matchLen, records, r.podCacheSize)
+			pos += matchLen
+			if pos == len(requestKeys) {
+				return nil
+			}
+
+			if startOff+matchLen == len(node.edge) {
+				curr = node
+			} else {
+				curr = r.splitNode(node, startOff+matchLen)
+			}
+			continue
+		}
+
+		newLen := 1
+		for pos+newLen < len(requestKeys) {
+			if _, exists := r.nodeLookup[requestKeys[pos+newLen]]; exists {
+				break
+			}
+			newLen++
+		}
+
+		newEntries := addEntryRefs(nil, records, r.podCacheSize)
+		if curr != r.root && !curr.hasChildren() && curr.perOffsetEntries == nil &&
+			slices.Equal(curr.sharedEntries, newEntries) {
+			baseOff := len(curr.edge)
+			curr.edge = append(curr.edge, requestKeys[pos:pos+newLen]...)
+			for i := 0; i < newLen; i++ {
+				r.nodeLookup[curr.edge[baseOff+i]] = nodeRef{node: curr, offset: baseOff + i}
+			}
+			pos += newLen
+			continue
+		}
+
+		edge := slices.Clone(requestKeys[pos : pos+newLen])
+		child := &RadixNode{
+			edge:          edge,
+			sharedEntries: newEntries,
+			parent:        curr,
+		}
+		curr.setChild(edge[0], child)
+		for i, k := range edge {
+			r.nodeLookup[k] = nodeRef{node: child, offset: i}
+		}
 		curr = child
+		pos += newLen
 	}
 
 	return nil
@@ -321,7 +658,7 @@ func (r *RadixTrieIndex) Evict(
 
 		allEmpty := true
 		for _, rk := range rks {
-			if node, ok := r.nodeLookup[rk]; ok && len(node.entries) > 0 {
+			if ref, ok := r.nodeLookup[rk]; ok && len(ref.node.entriesAt(ref.offset)) > 0 {
 				allEmpty = false
 				break
 			}
@@ -343,31 +680,33 @@ func (r *RadixTrieIndex) Evict(
 
 // evictPodsFromNode removes given entries from node, and prunes unused subtrees.
 func (r *RadixTrieIndex) evictPodsFromNode(requestKey BlockHash, entries []PodEntry) {
-	node, exists := r.nodeLookup[requestKey]
+	ref, exists := r.nodeLookup[requestKey]
 	if !exists {
 		return
 	}
 
-	node.entries = removeEntryRefs(node.entries, entries)
+	ref.node.removeRecordsAt(ref.offset, entries)
 
-	if len(node.entries) == 0 && len(node.children) == 0 {
-		r.pruneNode(node)
+	if !ref.node.hasChildren() && ref.node.isEmpty() {
+		r.pruneNode(ref.node)
 	}
 }
 
-// pruneNode removes a node from its parent and nodeLookup if it has no pods and no children.
+// pruneNode removes an empty leaf node and any resulting empty ancestors.
 func (r *RadixTrieIndex) pruneNode(node *RadixNode) {
 	curr := node
 	for curr != nil && curr != r.root {
-		if len(curr.entries) > 0 || len(curr.children) > 0 {
+		if curr.hasChildren() || !curr.isEmpty() {
 			break
 		}
 
 		parent := curr.parent
-		if parent != nil {
-			delete(parent.children, curr.key)
+		if parent != nil && len(curr.edge) > 0 {
+			parent.deleteChild(curr.edge[0])
 		}
-		delete(r.nodeLookup, curr.key)
+		for _, k := range curr.edge {
+			delete(r.nodeLookup, k)
+		}
 		curr = parent
 	}
 }
@@ -377,22 +716,31 @@ func (r *RadixTrieIndex) Clear(_ context.Context, podIdentifier string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for _, node := range r.nodeLookup {
-		n := 0
-		for _, ref := range node.entries {
-			if ref.PodIdentifier != podIdentifier {
-				node.entries[n] = ref
-				n++
-			}
-		}
-		clear(node.entries[n:])
-		node.entries = node.entries[:n]
+	r.clearSubtree(r.root, podIdentifier)
+	return nil
+}
 
-		if len(node.entries) == 0 && len(node.children) == 0 {
-			r.pruneNode(node)
+func (r *RadixTrieIndex) clearSubtree(node *RadixNode, podIdentifier string) {
+	for i := int(node.numInline) - 1; i >= 0; i-- {
+		r.clearSubtree(node.inlineChildren[i].node, podIdentifier)
+	}
+	for _, child := range node.children {
+		r.clearSubtree(child, podIdentifier)
+	}
+
+	if node == r.root {
+		return
+	}
+
+	node.removePodFromNode(podIdentifier)
+	if !node.hasChildren() && node.isEmpty() {
+		if node.parent != nil && len(node.edge) > 0 {
+			node.parent.deleteChild(node.edge[0])
+		}
+		for _, k := range node.edge {
+			delete(r.nodeLookup, k)
 		}
 	}
-	return nil
 }
 
 // GetRequestKey returns the last request key associated with the given engineKey.

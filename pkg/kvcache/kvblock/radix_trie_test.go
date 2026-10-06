@@ -232,6 +232,87 @@ func TestRadixTrieIndex_WalkKeys(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
+func TestRadixTrieIndex_EdgeCompressionAndSplitting(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(t.Context())
+	idx, err := NewRadixTrieIndex(nil)
+	require.NoError(t, err)
+
+	podA := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
+	podB := PodEntry{PodIdentifier: "pod-b", DeviceTier: "gpu"}
+	podC := PodEntry{PodIdentifier: "pod-c", DeviceTier: "cpu"}
+
+	branchA := []BlockHash{10, 11, 12, 13, 14, 15}
+	branchB := []BlockHash{10, 11, 12, 20, 21, 22}
+
+	require.NoError(t, idx.Add(ctx, nil, branchA, []PodEntry{podA}))
+	require.NoError(t, idx.Add(ctx, nil, branchB, []PodEntry{podB}))
+	require.NoError(t, idx.Add(ctx, nil, []BlockHash{10, 11}, []PodEntry{podC}))
+
+	resA, err := idx.Lookup(ctx, branchA, nil)
+	require.NoError(t, err)
+	require.Len(t, resA, 6)
+	assert.ElementsMatch(t, []PodEntry{podA, podB, podC}, resA[10])
+	assert.ElementsMatch(t, []PodEntry{podA, podB, podC}, resA[11])
+	assert.ElementsMatch(t, []PodEntry{podA, podB}, resA[12])
+	assert.ElementsMatch(t, []PodEntry{podA}, resA[13])
+	assert.ElementsMatch(t, []PodEntry{podA}, resA[14])
+	assert.ElementsMatch(t, []PodEntry{podA}, resA[15])
+
+	resB, err := idx.Lookup(ctx, branchB, nil)
+	require.NoError(t, err)
+	require.Len(t, resB, 6)
+	assert.ElementsMatch(t, []PodEntry{podB}, resB[20])
+	assert.ElementsMatch(t, []PodEntry{podB}, resB[21])
+	assert.ElementsMatch(t, []PodEntry{podB}, resB[22])
+
+	// Evict middle key 14 of compressed suffix [13, 14, 15]
+	require.NoError(t, idx.Evict(ctx, 14, RequestKey, []PodEntry{podA}))
+	resAfterEvict, err := idx.Lookup(ctx, branchA, nil)
+	require.NoError(t, err)
+	assert.Len(t, resAfterEvict, 4, "chain lookup should stop at evicted key 14")
+
+	// Direct lookup of key 15 should still find podA
+	res15, err := idx.Lookup(ctx, []BlockHash{15}, nil)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []PodEntry{podA}, res15[15])
+}
+
+func TestRadixTrieIndex_InlineToMapChildFanout(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(t.Context())
+	idx, err := NewRadixTrieIndex(nil)
+	require.NoError(t, err)
+
+	const fanout = 8
+	for branch := 0; branch < fanout; branch++ {
+		pod := PodEntry{PodIdentifier: fmt.Sprintf("pod-%d", branch), DeviceTier: "gpu"}
+		keys := []BlockHash{100, 101, BlockHash(1000 + branch*10), BlockHash(1001 + branch*10)}
+		require.NoError(t, idx.Add(ctx, nil, keys, []PodEntry{pod}))
+	}
+
+	for branch := 0; branch < fanout; branch++ {
+		pod := PodEntry{PodIdentifier: fmt.Sprintf("pod-%d", branch), DeviceTier: "gpu"}
+		keys := []BlockHash{100, 101, BlockHash(1000 + branch*10), BlockHash(1001 + branch*10)}
+		res, err := idx.Lookup(ctx, keys, nil)
+		require.NoError(t, err)
+		require.Len(t, res, 4)
+		assert.Equal(t, []PodEntry{pod}, res[keys[2]])
+		assert.Equal(t, []PodEntry{pod}, res[keys[3]])
+
+		visits := walkAll(t, idx, keys)
+		require.Len(t, visits, 4)
+		for _, v := range visits {
+			assert.True(t, v.found)
+		}
+	}
+
+	for branch := 0; branch < fanout; branch++ {
+		require.NoError(t, idx.Clear(ctx, fmt.Sprintf("pod-%d", branch)))
+	}
+	res, err := idx.Lookup(ctx, []BlockHash{100, 101}, nil)
+	require.NoError(t, err)
+	assert.Empty(t, res)
+}
+
 func BenchmarkRadixTrieVsInMemory(b *testing.B) {
 	ctx := context.Background()
 	numBlocks := 500 // 500 blocks x 16 tokens = 8,000 token prompt
