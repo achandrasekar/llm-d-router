@@ -59,6 +59,28 @@ func benchIndex(b *testing.B, numPods int) (kvblock.Index, []kvblock.BlockHash) 
 	return kvblock.NewTracedIndex(kvblock.NewInstrumentedIndex(inner)), keys
 }
 
+// benchRadixIndex fills a RadixTrieIndex with benchKeys request keys, each held
+// by numPods pods on the gpu tier, behind the production decorator chain.
+func benchRadixIndex(b *testing.B, numPods int) (kvblock.Index, []kvblock.BlockHash) {
+	b.Helper()
+	inner, err := kvblock.NewRadixTrieIndex(&kvblock.RadixTrieIndexConfig{Size: 1 << 20, PodCacheSize: 128})
+	if err != nil {
+		b.Fatal(err)
+	}
+	keys := make([]kvblock.BlockHash, benchKeys)
+	for i := range keys {
+		keys[i] = kvblock.BlockHash(uint64(i) + 1)
+	}
+	entries := make([]kvblock.PodEntry, numPods)
+	for p := range entries {
+		entries[p] = kvblock.PodEntry{PodIdentifier: fmt.Sprintf("10.0.%d.%d:8000", p/256, p%256), DeviceTier: "gpu"}
+	}
+	if err := inner.Add(context.Background(), nil, keys, entries); err != nil {
+		b.Fatal(err)
+	}
+	return kvblock.NewTracedIndex(kvblock.NewInstrumentedIndex(inner)), keys
+}
+
 func benchMatcher(b *testing.B, idx kvblock.Index) *kvcache.Indexer {
 	b.Helper()
 	return kvcache.NewIndexerForTest(&mockTokenProcessor{}, idx, kvcache.DefaultKVCacheBackendConfig())
@@ -80,8 +102,22 @@ func requireMatches(b *testing.B, matches map[string]kvcache.PodMatch, numPods i
 // 240K-token prompt produces, walking the index, across fleet sizes.
 func BenchmarkMatchBlockKeys(b *testing.B) {
 	for _, numPods := range []int{8, 96} {
-		b.Run(fmt.Sprintf("keys=3750/pods=%d", numPods), func(b *testing.B) {
+		b.Run(fmt.Sprintf("InMemory/keys=3750/pods=%d", numPods), func(b *testing.B) {
 			idx, keys := benchIndex(b, numPods)
+			indexer := benchMatcher(b, idx)
+			ctx := benchContext()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				matches, err := indexer.MatchBlockKeys(ctx, keys, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				requireMatches(b, matches, numPods)
+			}
+		})
+		b.Run(fmt.Sprintf("RadixTrie/keys=3750/pods=%d", numPods), func(b *testing.B) {
+			idx, keys := benchRadixIndex(b, numPods)
 			indexer := benchMatcher(b, idx)
 			ctx := benchContext()
 			b.ReportAllocs()
@@ -122,7 +158,7 @@ func BenchmarkMatchBlockKeysMaterialized(b *testing.B) {
 // request traffic sharing one index.
 func BenchmarkMatchBlockKeysParallel(b *testing.B) {
 	for _, numPods := range []int{8, 96} {
-		b.Run(fmt.Sprintf("keys=3750/pods=%d", numPods), func(b *testing.B) {
+		b.Run(fmt.Sprintf("InMemory/keys=3750/pods=%d", numPods), func(b *testing.B) {
 			idx, keys := benchIndex(b, numPods)
 			indexer := benchMatcher(b, idx)
 			ctx := benchContext()
@@ -130,6 +166,26 @@ func BenchmarkMatchBlockKeysParallel(b *testing.B) {
 			b.ResetTimer()
 			// Error rather than Fatal: FailNow from a RunParallel worker
 			// exits that goroutine and stalls the benchmark.
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					matches, err := indexer.MatchBlockKeys(ctx, keys, nil)
+					if err != nil {
+						b.Error(err)
+						return
+					}
+					if len(matches) != numPods {
+						b.Errorf("matched %d pods, want %d", len(matches), numPods)
+						return
+					}
+				}
+			})
+		})
+		b.Run(fmt.Sprintf("RadixTrie/keys=3750/pods=%d", numPods), func(b *testing.B) {
+			idx, keys := benchRadixIndex(b, numPods)
+			indexer := benchMatcher(b, idx)
+			ctx := benchContext()
+			b.ReportAllocs()
+			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
 					matches, err := indexer.MatchBlockKeys(ctx, keys, nil)
@@ -152,44 +208,52 @@ func BenchmarkMatchBlockKeysParallel(b *testing.B) {
 // matching against the KV-event firehose.
 func BenchmarkMatchBlockKeysWithWriters(b *testing.B) {
 	const numPods, writers = 96, 8
-	idx, keys := benchIndex(b, numPods)
-	indexer := benchMatcher(b, idx)
-	ctx := benchContext()
+	for _, tc := range []struct {
+		name string
+		fn   func(*testing.B, int) (kvblock.Index, []kvblock.BlockHash)
+	}{
+		{"InMemory", benchIndex},
+		{"RadixTrie", benchRadixIndex},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			idx, keys := tc.fn(b, numPods)
+			indexer := benchMatcher(b, idx)
+			ctx := benchContext()
 
-	stop := make(chan struct{})
-	defer close(stop)
-	for w := 0; w < writers; w++ {
-		go func(w int) {
-			entries := []kvblock.PodEntry{{PodIdentifier: fmt.Sprintf("10.1.0.%d:8000", w), DeviceTier: "gpu"}}
-			engineKeys := make([]kvblock.BlockHash, 64)
-			requestKeys := make([]kvblock.BlockHash, 64)
-			// Writer key ranges sit above the request keys, so writes
-			// contend with the walk without joining its matches.
-			for i := uint64(0); ; i++ {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				base := (uint64(w+1)<<32 | i*64) + 1 //#nosec G115 -- test data, w is a small worker index
-				for j := range engineKeys {
-					engineKeys[j] = kvblock.BlockHash(base + uint64(j))
-					requestKeys[j] = kvblock.BlockHash(base + uint64(j))
-				}
-				_ = idx.Add(ctx, engineKeys, requestKeys, entries)
+			stop := make(chan struct{})
+			defer close(stop)
+			for w := 0; w < writers; w++ {
+				go func(w int) {
+					entries := []kvblock.PodEntry{{PodIdentifier: fmt.Sprintf("10.1.0.%d:8000", w), DeviceTier: "gpu"}}
+					engineKeys := make([]kvblock.BlockHash, 64)
+					requestKeys := make([]kvblock.BlockHash, 64)
+					for i := uint64(0); ; i++ {
+						select {
+						case <-stop:
+							return
+						default:
+						}
+						base := (uint64(w+1)<<32 | i*64) + 1 //#nosec G115 -- test data, w is a small worker index
+						for j := range engineKeys {
+							engineKeys[j] = kvblock.BlockHash(base + uint64(j))
+							requestKeys[j] = kvblock.BlockHash(base + uint64(j))
+						}
+						_ = idx.Add(ctx, engineKeys, requestKeys, entries)
+					}
+				}(w)
 			}
-		}(w)
-	}
 
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		matches, err := indexer.MatchBlockKeys(ctx, keys, nil)
-		if err != nil {
-			b.Fatal(err)
-		}
-		if len(matches) != numPods {
-			b.Fatalf("matched %d pods, want %d", len(matches), numPods)
-		}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				matches, err := indexer.MatchBlockKeys(ctx, keys, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(matches) != numPods {
+					b.Fatalf("matched %d pods, want %d", len(matches), numPods)
+				}
+			}
+		})
 	}
 }

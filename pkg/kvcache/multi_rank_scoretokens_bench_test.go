@@ -45,24 +45,12 @@ func BenchmarkScoreTokensMultiRank(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	cfg, err := kvcache.NewDefaultConfig()
-	if err != nil {
-		b.Fatal(err)
-	}
-	cfg.KVBlockIndexConfig.InMemoryConfig = &kvblock.InMemoryIndexConfig{Size: 1 << 20, PodCacheSize: 512}
-	indexer, err := kvcache.NewKVCacheIndexer(ctx, cfg, tp)
-	if err != nil {
-		b.Fatal(err)
-	}
 
 	tokens := make([]uint32, blocks*blockSize)
 	for i := range tokens {
 		tokens[i] = uint32(i%50000 + 1)
 	}
-	keys, err := indexer.ComputeBlockKeysFromTokens(ctx, tokens, "bench-model", nil)
-	if err != nil {
-		b.Fatal(err)
-	}
+
 	entries := make([]kvblock.PodEntry, 0, pods*ranks)
 	for p := 0; p < pods; p++ {
 		for r := 0; r < ranks; r++ {
@@ -72,19 +60,46 @@ func BenchmarkScoreTokensMultiRank(b *testing.B) {
 			})
 		}
 	}
-	if err := indexer.KVBlockIndex().Add(ctx, nil, keys, entries); err != nil {
-		b.Fatal(err)
-	}
 
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		scores, err := indexer.ScoreTokens(ctx, tokens, "bench-model", nil, nil)
-		if err != nil {
-			b.Fatal(err)
+	for _, useRadix := range []bool{false, true} {
+		name := "InMemory"
+		if useRadix {
+			name = "RadixTrie"
 		}
-		if len(scores) != pods {
-			b.Fatalf("scored %d pods, want %d", len(scores), pods)
-		}
+		b.Run(name, func(b *testing.B) {
+			cfg, err := kvcache.NewDefaultConfig()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if useRadix {
+				cfg.KVBlockIndexConfig.InMemoryConfig = nil
+				cfg.KVBlockIndexConfig.RadixTrieConfig = &kvblock.RadixTrieIndexConfig{Size: 1 << 20, PodCacheSize: 512}
+			} else {
+				cfg.KVBlockIndexConfig.InMemoryConfig = &kvblock.InMemoryIndexConfig{Size: 1 << 20, PodCacheSize: 512}
+			}
+			indexer, err := kvcache.NewKVCacheIndexer(ctx, cfg, tp)
+			if err != nil {
+				b.Fatal(err)
+			}
+			keys, err := indexer.ComputeBlockKeysFromTokens(ctx, tokens, "bench-model", nil)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := indexer.KVBlockIndex().Add(ctx, nil, keys, entries); err != nil {
+				b.Fatal(err)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				scores, err := indexer.ScoreTokens(ctx, tokens, "bench-model", nil, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(scores) != pods {
+					b.Fatalf("scored %d pods, want %d", len(scores), pods)
+				}
+			}
+		})
 	}
 }

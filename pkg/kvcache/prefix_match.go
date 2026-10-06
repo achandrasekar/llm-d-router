@@ -134,8 +134,8 @@ func matchWalk(ctx context.Context, walker kvblock.KeyWalker, keys []kvblock.Blo
 	acc := acquireAccumulator(weights, filter)
 	defer releaseAccumulator(acc)
 
-	err := walker.WalkKeys(ctx, keys, func(_ int, found bool, entries []kvblock.EntryRef) bool {
-		return found && len(entries) > 0 && acc.key(entries)
+	err := walker.WalkKeys(ctx, keys, func(pos int, found bool, entries []kvblock.EntryRef) bool {
+		return found && len(entries) > 0 && acc.keyAt(pos, keys[pos], entries)
 	})
 	if err != nil {
 		return nil, err
@@ -323,11 +323,13 @@ type prefixAccumulator struct {
 	weights map[string]float64
 	filter  sets.Set[string]
 
-	table    slotTable
-	slots    []matchSlot
-	active   []int32
-	keyStamp uint32
-	first    bool
+	table       slotTable
+	slots       []matchSlot
+	active      []int32
+	keyStamp    uint32
+	first       bool
+	prevEntries []kvblock.EntryRef
+	prevKey     kvblock.BlockHash
 
 	// weightCache holds the weight of every tier seen in this accumulation,
 	// scanned linearly: requests see a handful of tiers.
@@ -343,13 +345,44 @@ func acquireAccumulator(weights map[string]float64, filter sets.Set[string]) *pr
 	a.active = a.active[:0]
 	a.keyStamp = 0
 	a.first = true
+	a.prevEntries = nil
+	a.prevKey = 0
 	a.weightCache = a.weightCache[:0]
 	return a
 }
 
 func releaseAccumulator(a *prefixAccumulator) {
 	a.weights, a.filter = nil, nil
+	a.prevEntries = nil
 	accumulatorPool.Put(a)
+}
+
+func (a *prefixAccumulator) keyAt(pos int, k kvblock.BlockHash, entries []kvblock.EntryRef) bool {
+	if pos > 0 && k != a.prevKey && len(entries) == len(a.prevEntries) &&
+		len(entries) > 0 && &entries[0] == &a.prevEntries[0] {
+		a.prevKey = k
+		return a.repeatPrevKey()
+	}
+	a.prevEntries = entries
+	a.prevKey = k
+	return a.key(entries)
+}
+
+func (a *prefixAccumulator) repeatPrevKey() bool {
+	for _, i := range a.active {
+		s := &a.slots[i]
+		s.matched++
+		s.score += s.weight
+		if s.confirmedAlive {
+			s.confirmed++
+		}
+		for t := range s.tiers {
+			if s.tiers[t].alive {
+				s.tiers[t].count++
+			}
+		}
+	}
+	return len(a.active) > 0
 }
 
 // key folds one key's entries into the chains and reports whether any chain
