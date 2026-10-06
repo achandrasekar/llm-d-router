@@ -169,7 +169,7 @@ func TestIndexer_MatchLongestPrefix_CompressionAndEviction(t *testing.T) {
 
 	i.Add(branchA, s1)
 	i.Add(branchB, s2)
-	i.Add(branchA, s3) // s3 has capacity 4, so only head [10, 11, 12, 13] survive
+	i.Add(branchA, s3) // s3 has capacity 4, so only prefix [10, 11, 12, 13] survives
 
 	resA := i.MatchLongestPrefix(branchA)
 	assert.Equal(t, 6, resA[s1.ServerID])
@@ -203,6 +203,8 @@ func legacyMatchLongestPrefix(idx indexerInterface, hashes []blockHash) map[Serv
 }
 
 func BenchmarkApproximatePrefixMatchLongestPrefix(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	for _, numBlocks := range []int{31, 63, 500, 2048} {
 		for _, numPods := range []int{4, 8, 96} {
 			name := fmt.Sprintf("blocks=%d/pods=%d", numBlocks, numPods)
@@ -211,7 +213,7 @@ func BenchmarkApproximatePrefixMatchLongestPrefix(b *testing.B) {
 				hashes[j] = blockHash(uint64(j) + 1)
 			}
 
-			idx := newIndexer(context.Background(), numBlocks*2, "bench", "bench")
+			idx := newIndexer(ctx, numBlocks*2, "bench", "bench")
 			for p := 0; p < numPods; p++ {
 				srv := server{
 					ServerID:       ServerID{Namespace: "default", Name: fmt.Sprintf("pod-%d", p)},

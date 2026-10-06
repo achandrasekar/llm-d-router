@@ -480,6 +480,26 @@ func BenchmarkScenarioA_500Tokens(b *testing.B) {
 			_, _ = radix.Lookup(ctx, requestKeys, filter)
 		}
 	})
+
+	b.Run("InMemory_500Tokens_WalkKeys", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = inMem.WalkKeys(ctx, requestKeys, func(_ int, found bool, refs []EntryRef) bool {
+				return found && len(refs) > 0
+			})
+		}
+	})
+
+	b.Run("RadixTrie_500Tokens_WalkKeys", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = radix.WalkKeys(ctx, requestKeys, func(_ int, found bool, refs []EntryRef) bool {
+				return found && len(refs) > 0
+			})
+		}
+	})
 }
 
 func BenchmarkScenarioB_1000Tokens(b *testing.B) {
@@ -517,6 +537,26 @@ func BenchmarkScenarioB_1000Tokens(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			_, _ = radix.Lookup(ctx, requestKeys, filter)
+		}
+	})
+
+	b.Run("InMemory_1000Tokens_WalkKeys", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = inMem.WalkKeys(ctx, requestKeys, func(_ int, found bool, refs []EntryRef) bool {
+				return found && len(refs) > 0
+			})
+		}
+	})
+
+	b.Run("RadixTrie_1000Tokens_WalkKeys", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = radix.WalkKeys(ctx, requestKeys, func(_ int, found bool, refs []EntryRef) bool {
+				return found && len(refs) > 0
+			})
 		}
 	})
 }

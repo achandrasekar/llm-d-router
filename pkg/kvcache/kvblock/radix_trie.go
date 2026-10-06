@@ -29,8 +29,9 @@ import (
 )
 
 const (
-	inlineChildCapacity = 4
-	radixShardCount     = 256
+	inlineChildCapacity  = 4
+	radixShardCount      = 256
+	maxCompressedEdgeLen = 64
 )
 
 func radixShardIndex(key BlockHash) uint8 {
@@ -206,34 +207,6 @@ func (n *RadixNode) addRecordsFullEdge(recs []EntryRef, capacity int) {
 	newPerOffset := make([][]EntryRef, len(old.perOffsetEntries))
 	for i := range old.perOffsetEntries {
 		newPerOffset[i] = addEntryRefsCOW(old.perOffsetEntries[i], recs, capacity)
-	}
-	next.perOffsetEntries = newPerOffset
-	n.snap.Store(&next)
-}
-
-func (n *RadixNode) addRecordsRange(start, end int, recs []EntryRef, capacity int) {
-	old := n.snap.Load()
-	if start == 0 && end == len(old.edge) {
-		n.addRecordsFullEdge(recs, capacity)
-		return
-	}
-	next := *old
-	var newPerOffset [][]EntryRef
-	if old.perOffsetEntries == nil {
-		newPerOffset = make([][]EntryRef, len(old.edge))
-		for i := range old.edge {
-			if i >= start && i < end {
-				newPerOffset[i] = addEntryRefsCOW(old.sharedEntries, recs, capacity)
-			} else {
-				newPerOffset[i] = old.sharedEntries
-			}
-		}
-		next.sharedEntries = nil
-	} else {
-		newPerOffset = slices.Clone(old.perOffsetEntries)
-		for i := start; i < end; i++ {
-			newPerOffset[i] = addEntryRefsCOW(old.perOffsetEntries[i], recs, capacity)
-		}
 	}
 	next.perOffsetEntries = newPerOffset
 	n.snap.Store(&next)
@@ -660,8 +633,9 @@ func (r *RadixTrieIndex) Lookup(
 		return nil, fmt.Errorf("no requestKeys provided for lookup")
 	}
 
-	podsPerKey := make(map[BlockHash][]PodEntry)
+	podsPerKey := make(map[BlockHash][]PodEntry, len(requestKeys))
 	var snap *radixNodeSnapshot
+	var sharedMatchedPods []PodEntry
 	offset := 0
 	var parentSnap *radixNodeSnapshot
 
@@ -674,6 +648,7 @@ func (r *RadixTrieIndex) Lookup(
 			// Fast path: contiguous compressed edge match.
 		} else {
 			snap = nil
+			sharedMatchedPods = nil
 			if parentSnap != nil {
 				if child := parentSnap.getChild(requestKey); child != nil {
 					snap = child.snap.Load()
@@ -701,14 +676,27 @@ func (r *RadixTrieIndex) Lookup(
 			break
 		}
 
-		entries := snap.entriesAt(offset)
-		if len(entries) == 0 {
-			break
-		}
-
-		matchedPods := filterEntryRefs(entries, podIdentifierSet)
-		if len(matchedPods) == 0 {
-			break
+		var matchedPods []PodEntry
+		if snap.perOffsetEntries == nil {
+			if sharedMatchedPods == nil {
+				if len(snap.sharedEntries) == 0 {
+					break
+				}
+				sharedMatchedPods = filterEntryRefs(snap.sharedEntries, podIdentifierSet)
+				if len(sharedMatchedPods) == 0 {
+					break
+				}
+			}
+			matchedPods = sharedMatchedPods
+		} else {
+			entries := snap.entriesAt(offset)
+			if len(entries) == 0 {
+				break
+			}
+			matchedPods = filterEntryRefs(entries, podIdentifierSet)
+			if len(matchedPods) == 0 {
+				break
+			}
 		}
 
 		podsPerKey[requestKey] = matchedPods
@@ -716,6 +704,7 @@ func (r *RadixTrieIndex) Lookup(
 		if offset == len(snap.edge) {
 			parentSnap = snap
 			snap = nil
+			sharedMatchedPods = nil
 		}
 	}
 
@@ -726,10 +715,10 @@ func (r *RadixTrieIndex) Lookup(
 	return podsPerKey, nil
 }
 
-// splitNode splits node at splitIdx (0 < splitIdx < len(node.edge)) into newly
+// splitNodePair splits node at splitIdx (0 < splitIdx < len(node.edge)) into newly
 // allocated prefixNode and suffixNode instances, leaving the old node's snapshot
 // intact for any in-flight lock-free reader. Called with treeShards[node.shardID].mu held.
-func (r *RadixTrieIndex) splitNode(node *RadixNode, splitIdx int) *RadixNode {
+func (r *RadixTrieIndex) splitNodePair(node *RadixNode, splitIdx int) (*RadixNode, *RadixNode) {
 	oldSnap := node.snap.Load()
 	parent := node.parent
 	prefixEdge := oldSnap.edge[:splitIdx:splitIdx]
@@ -780,7 +769,7 @@ func (r *RadixTrieIndex) splitNode(node *RadixNode, splitIdx int) *RadixNode {
 	r.setNodeRefs(prefixNode, prefixEdge, 0)
 	r.setNodeRefs(suffixNode, suffixEdge, 0)
 
-	return prefixNode
+	return prefixNode, suffixNode
 }
 
 // Add stores requestKey -> pod entries and (optionally) engineKey -> requestKey mappings in the Radix Trie.
@@ -842,13 +831,7 @@ func (r *RadixTrieIndex) Add(
 				continue
 			}
 
-			if pos+matchLen == len(requestKeys) {
-				child.addRecordsRange(0, matchLen, records, r.podCacheSize)
-				pos += matchLen
-				break
-			}
-
-			prefixNode := r.splitNode(child, matchLen)
+			prefixNode, _ := r.splitNodePair(child, matchLen)
 			prefixNode.addRecordsFullEdge(records, r.podCacheSize)
 			curr = prefixNode
 			pos += matchLen
@@ -878,17 +861,16 @@ func (r *RadixTrieIndex) Add(
 				matchLen++
 			}
 
-			node.addRecordsRange(startOff, startOff+matchLen, records, r.podCacheSize)
+			if startOff > 0 {
+				_, node = r.splitNodePair(node, startOff)
+				nodeSnap = node.snap.Load()
+			}
+			if matchLen < len(nodeSnap.edge) {
+				node, _ = r.splitNodePair(node, matchLen)
+			}
+			node.addRecordsFullEdge(records, r.podCacheSize)
+			curr = node
 			pos += matchLen
-			if pos == len(requestKeys) {
-				break
-			}
-
-			if startOff+matchLen == len(nodeSnap.edge) {
-				curr = node
-			} else {
-				curr = r.splitNode(node, startOff+matchLen)
-			}
 			continue
 		}
 
@@ -901,8 +883,17 @@ func (r *RadixTrieIndex) Add(
 			}
 		}
 
+		currSnap = curr.snap.Load()
+		canExtendCurr := curr != r.treeShards[lockedShard].root && !currSnap.hasChildren() &&
+			currSnap.perOffsetEntries == nil && len(currSnap.edge) < maxCompressedEdgeLen
+
+		limit := min(len(requestKeys)-pos, maxCompressedEdgeLen)
+		if canExtendCurr {
+			limit = min(len(requestKeys)-pos, maxCompressedEdgeLen-len(currSnap.edge))
+		}
+
 		maxLen := 1
-		for pos+maxLen < len(requestKeys) {
+		for maxLen < limit {
 			nextKey := requestKeys[pos+maxLen]
 			if r.hasNodeRef(nextKey) || slices.Contains(requestKeys[pos:pos+maxLen], nextKey) {
 				break
@@ -911,9 +902,7 @@ func (r *RadixTrieIndex) Add(
 		}
 
 		newEntries := addEntryRefsCOW(nil, records, r.podCacheSize)
-		currSnap = curr.snap.Load()
-		if curr != r.treeShards[lockedShard].root && !currSnap.hasChildren() && currSnap.perOffsetEntries == nil &&
-			slices.Equal(currSnap.sharedEntries, newEntries) {
+		if canExtendCurr && slices.Equal(currSnap.sharedEntries, newEntries) {
 			baseOff := len(currSnap.edge)
 			claimed := 0
 			for claimed < maxLen {
