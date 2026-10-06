@@ -234,35 +234,7 @@ func (pc *PodCache) matching(podIdentifier string) []PodEntry {
 // assigned all or nothing: when its new pods or tiers would exceed a cap, no
 // ordinal is consumed and the error names the cap.
 func (m *InMemoryIndex) internRecords(entries []PodEntry) ([]EntryRef, error) {
-	m.pods.mu.Lock()
-	defer m.pods.mu.Unlock()
-	m.tiers.mu.Lock()
-	defer m.tiers.mu.Unlock()
-
-	if !m.pods.fitsLocked(func(yield func(string)) {
-		for i := range entries {
-			yield(entries[i].PodIdentifier)
-		}
-	}) {
-		return nil, fmt.Errorf("%w: %d pod identifiers", errIndexCardinality, maxInternedPods)
-	}
-	if !m.tiers.fitsLocked(func(yield func(string)) {
-		for i := range entries {
-			yield(entries[i].DeviceTier)
-		}
-	}) {
-		return nil, fmt.Errorf("%w: %d device tiers", errIndexCardinality, maxInternedTiers)
-	}
-
-	records := make([]EntryRef, len(entries))
-	for i, entry := range entries {
-		records[i] = EntryRef{
-			PodEntry:    entry,
-			PodOrdinal:  m.pods.internLocked(entry.PodIdentifier),
-			TierOrdinal: m.tiers.internLocked(entry.DeviceTier),
-		}
-	}
-	return records, nil
+	return internEntryRecords(m.pods, m.tiers, entries)
 }
 
 // Lookup receives a list of requestKeys and a set of pod identifiers,

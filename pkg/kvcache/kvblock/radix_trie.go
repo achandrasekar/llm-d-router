@@ -25,11 +25,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-const (
-	defaultRadixTrieCapacity = 1e8
-	defaultRadixTriePodSize  = 10
-)
-
 // RadixTrieIndexConfig holds the configuration for RadixTrieIndex.
 type RadixTrieIndexConfig struct {
 	// Size is the maximum number of engine keys to track in LRU mapping.
@@ -41,15 +36,15 @@ type RadixTrieIndexConfig struct {
 // DefaultRadixTrieIndexConfig returns a default configuration for RadixTrieIndex.
 func DefaultRadixTrieIndexConfig() *RadixTrieIndexConfig {
 	return &RadixTrieIndexConfig{
-		Size:         defaultRadixTrieCapacity,
-		PodCacheSize: defaultRadixTriePodSize,
+		Size:         defaultInMemoryIndexSize,
+		PodCacheSize: defaultPodsPerKey,
 	}
 }
 
 // RadixNode represents a node in the KV-cache prefix Radix Trie.
 type RadixNode struct {
 	key      BlockHash
-	pods     map[PodEntry]struct{}
+	entries  []EntryRef
 	children map[BlockHash]*RadixNode
 	parent   *RadixNode
 }
@@ -58,10 +53,68 @@ type RadixNode struct {
 func newRadixNode(key BlockHash, parent *RadixNode) *RadixNode {
 	return &RadixNode{
 		key:      key,
-		pods:     make(map[PodEntry]struct{}),
 		children: make(map[BlockHash]*RadixNode),
 		parent:   parent,
 	}
+}
+
+// addEntryRefs inserts records with LRU semantics bounded by capacity.
+func addEntryRefs(entries, recs []EntryRef, capacity int) []EntryRef {
+	for _, rec := range recs {
+		found := false
+		for i := range entries {
+			if entries[i].PodEntry == rec.PodEntry {
+				copy(entries[i:], entries[i+1:])
+				entries[len(entries)-1] = rec
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		if capacity > 0 && len(entries) >= capacity {
+			copy(entries, entries[1:])
+			entries[len(entries)-1] = rec
+			continue
+		}
+		entries = append(entries, rec)
+	}
+	return entries
+}
+
+// removeEntryRefs deletes matching PodEntry records from entries.
+func removeEntryRefs(entries []EntryRef, toRemove []PodEntry) []EntryRef {
+	for _, entry := range toRemove {
+		for i := range entries {
+			if entries[i].PodEntry == entry {
+				entries = append(entries[:i], entries[i+1:]...)
+				break
+			}
+		}
+	}
+	return entries
+}
+
+// filterEntryRefs returns the PodEntry slice matching allowed (all entries when allowed is empty).
+func filterEntryRefs(entries []EntryRef, allowed sets.Set[string]) []PodEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	if allowed.Len() == 0 {
+		matched := make([]PodEntry, len(entries))
+		for i := range entries {
+			matched[i] = entries[i].PodEntry
+		}
+		return matched
+	}
+	var matched []PodEntry
+	for i := range entries {
+		if allowed.Has(entries[i].PodIdentifier) {
+			matched = append(matched, entries[i].PodEntry)
+		}
+	}
+	return matched
 }
 
 // RadixTrieIndex is an O(L) Radix-Trie based implementation of the Index interface.
@@ -71,17 +124,30 @@ type RadixTrieIndex struct {
 	nodeLookup          map[BlockHash]*RadixNode
 	engineToRequestKeys *lru.Cache[BlockHash, []BlockHash]
 	podCacheSize        int
+	pods                *interner
+	tiers               *interner
 }
 
-var _ Index = &RadixTrieIndex{}
+var (
+	_ Index     = &RadixTrieIndex{}
+	_ KeyWalker = &RadixTrieIndex{}
+)
 
 // NewRadixTrieIndex creates a new RadixTrieIndex instance.
 func NewRadixTrieIndex(cfg *RadixTrieIndexConfig) (*RadixTrieIndex, error) {
 	if cfg == nil {
 		cfg = DefaultRadixTrieIndexConfig()
 	}
+	size := cfg.Size
+	if size <= 0 {
+		size = defaultInMemoryIndexSize
+	}
+	podCacheSize := cfg.PodCacheSize
+	if podCacheSize <= 0 {
+		podCacheSize = defaultPodsPerKey
+	}
 
-	engineToRequestKeys, err := lru.New[BlockHash, []BlockHash](cfg.Size)
+	engineToRequestKeys, err := lru.New[BlockHash, []BlockHash](size)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize radix trie engine key map: %w", err)
 	}
@@ -90,14 +156,53 @@ func NewRadixTrieIndex(cfg *RadixTrieIndexConfig) (*RadixTrieIndex, error) {
 		root:                newRadixNode(EmptyBlockHash, nil),
 		nodeLookup:          make(map[BlockHash]*RadixNode),
 		engineToRequestKeys: engineToRequestKeys,
-		podCacheSize:        cfg.PodCacheSize,
+		podCacheSize:        podCacheSize,
+		pods:                newInterner(maxInternedPods),
+		tiers:               newInterner(maxInternedTiers),
 	}, nil
+}
+
+// WalkKeys implements KeyWalker, visiting requestKeys in order without materializing
+// per-key PodEntry slices.
+func (r *RadixTrieIndex) WalkKeys(
+	ctx context.Context,
+	requestKeys []BlockHash,
+	visit func(pos int, found bool, entries []EntryRef) bool,
+) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	curr := r.root
+	for pos, key := range requestKeys {
+		if pos&cancellationCheckMask == 0 && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var node *RadixNode
+		if curr != nil {
+			node = curr.children[key]
+		}
+		if node == nil {
+			node = r.nodeLookup[key]
+		}
+		if node == nil || len(node.entries) == 0 {
+			curr = nil
+			if !visit(pos, false, nil) {
+				return ctx.Err()
+			}
+			continue
+		}
+		curr = node
+		if !visit(pos, true, node.entries) {
+			return ctx.Err()
+		}
+	}
+	return ctx.Err()
 }
 
 // Lookup receives a list of requestKeys and a set of pod identifiers,
 // and retrieves the filtered pods associated with those keys by traversing the Radix Trie.
 func (r *RadixTrieIndex) Lookup(
-	_ context.Context,
+	ctx context.Context,
 	requestKeys []BlockHash,
 	podIdentifierSet sets.Set[string],
 ) (map[BlockHash][]PodEntry, error) {
@@ -111,34 +216,34 @@ func (r *RadixTrieIndex) Lookup(
 	podsPerKey := make(map[BlockHash][]PodEntry)
 	curr := r.root
 
-	for _, requestKey := range requestKeys {
-		child, exists := curr.children[requestKey]
-		if !exists || len(child.pods) == 0 {
-			// Early stop: prefix chain breaks here
+	for idx, requestKey := range requestKeys {
+		if idx&cancellationCheckMask == 0 && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		child := curr.children[requestKey]
+		if child == nil {
+			if idx == 0 {
+				child = r.nodeLookup[requestKey]
+			} else {
+				child = r.root.children[requestKey]
+			}
+		}
+		if child == nil || len(child.entries) == 0 {
 			break
 		}
 
-		var matchedPods []PodEntry
-		if podIdentifierSet.Len() == 0 {
-			matchedPods = make([]PodEntry, 0, len(child.pods))
-			for pod := range child.pods {
-				matchedPods = append(matchedPods, pod)
-			}
-		} else {
-			for pod := range child.pods {
-				if podIdentifierSet.Has(pod.PodIdentifier) {
-					matchedPods = append(matchedPods, pod)
-				}
-			}
-		}
-
+		matchedPods := filterEntryRefs(child.entries, podIdentifierSet)
 		if len(matchedPods) == 0 {
-			// No pods match after filtering: prefix chain breaks here
 			break
 		}
 
 		podsPerKey[requestKey] = matchedPods
 		curr = child
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	return podsPerKey, nil
@@ -152,6 +257,11 @@ func (r *RadixTrieIndex) Add(
 ) error {
 	if len(requestKeys) == 0 || len(entries) == 0 {
 		return fmt.Errorf("no keys or entries provided for adding to index")
+	}
+
+	records, err := internEntryRecords(r.pods, r.tiers, entries)
+	if err != nil {
+		return err
 	}
 
 	r.mu.Lock()
@@ -168,15 +278,16 @@ func (r *RadixTrieIndex) Add(
 	for _, requestKey := range requestKeys {
 		child, exists := curr.children[requestKey]
 		if !exists {
-			child = newRadixNode(requestKey, curr)
-			curr.children[requestKey] = child
-			r.nodeLookup[requestKey] = child
+			if existing, ok := r.nodeLookup[requestKey]; ok {
+				child = existing
+			} else {
+				child = newRadixNode(requestKey, curr)
+				curr.children[requestKey] = child
+				r.nodeLookup[requestKey] = child
+			}
 		}
 
-		for _, entry := range entries {
-			child.pods[entry] = struct{}{}
-		}
-
+		child.entries = addEntryRefs(child.entries, records, r.podCacheSize)
 		curr = child
 	}
 
@@ -199,7 +310,7 @@ func (r *RadixTrieIndex) Evict(
 
 	switch keyType {
 	case EngineKey:
-		rks, found := r.engineToRequestKeys.Get(key)
+		rks, found := r.engineToRequestKeys.Peek(key)
 		if !found {
 			return nil
 		}
@@ -210,7 +321,7 @@ func (r *RadixTrieIndex) Evict(
 
 		allEmpty := true
 		for _, rk := range rks {
-			if node, ok := r.nodeLookup[rk]; ok && len(node.pods) > 0 {
+			if node, ok := r.nodeLookup[rk]; ok && len(node.entries) > 0 {
 				allEmpty = false
 				break
 			}
@@ -237,12 +348,9 @@ func (r *RadixTrieIndex) evictPodsFromNode(requestKey BlockHash, entries []PodEn
 		return
 	}
 
-	for _, entry := range entries {
-		delete(node.pods, entry)
-	}
+	node.entries = removeEntryRefs(node.entries, entries)
 
-	// Prune node if empty and has no children
-	if len(node.pods) == 0 && len(node.children) == 0 {
+	if len(node.entries) == 0 && len(node.children) == 0 {
 		r.pruneNode(node)
 	}
 }
@@ -251,7 +359,7 @@ func (r *RadixTrieIndex) evictPodsFromNode(requestKey BlockHash, entries []PodEn
 func (r *RadixTrieIndex) pruneNode(node *RadixNode) {
 	curr := node
 	for curr != nil && curr != r.root {
-		if len(curr.pods) > 0 || len(curr.children) > 0 {
+		if len(curr.entries) > 0 || len(curr.children) > 0 {
 			break
 		}
 
@@ -270,13 +378,17 @@ func (r *RadixTrieIndex) Clear(_ context.Context, podIdentifier string) error {
 	defer r.mu.Unlock()
 
 	for _, node := range r.nodeLookup {
-		for entry := range node.pods {
-			if entry.PodIdentifier == podIdentifier {
-				delete(node.pods, entry)
+		n := 0
+		for _, ref := range node.entries {
+			if ref.PodIdentifier != podIdentifier {
+				node.entries[n] = ref
+				n++
 			}
 		}
+		clear(node.entries[n:])
+		node.entries = node.entries[:n]
 
-		if len(node.pods) == 0 && len(node.children) == 0 {
+		if len(node.entries) == 0 && len(node.children) == 0 {
 			r.pruneNode(node)
 		}
 	}

@@ -18,6 +18,7 @@ package kvblock
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -147,4 +148,39 @@ func (in *interner) internLocked(s string) uint32 {
 	id := uint32(len(in.ids))
 	in.ids[s] = id
 	return id
+}
+
+// internEntryRecords pairs each entry with its pod and tier ordinals. A batch
+// is assigned all or nothing: when its new pods or tiers would exceed a cap,
+// no ordinal is consumed and the error names the cap.
+func internEntryRecords(pods, tiers *interner, entries []PodEntry) ([]EntryRef, error) {
+	pods.mu.Lock()
+	defer pods.mu.Unlock()
+	tiers.mu.Lock()
+	defer tiers.mu.Unlock()
+
+	if !pods.fitsLocked(func(yield func(string)) {
+		for i := range entries {
+			yield(entries[i].PodIdentifier)
+		}
+	}) {
+		return nil, fmt.Errorf("%w: %d pod identifiers", errIndexCardinality, maxInternedPods)
+	}
+	if !tiers.fitsLocked(func(yield func(string)) {
+		for i := range entries {
+			yield(entries[i].DeviceTier)
+		}
+	}) {
+		return nil, fmt.Errorf("%w: %d device tiers", errIndexCardinality, maxInternedTiers)
+	}
+
+	records := make([]EntryRef, len(entries))
+	for i, entry := range entries {
+		records[i] = EntryRef{
+			PodEntry:    entry,
+			PodOrdinal:  pods.internLocked(entry.PodIdentifier),
+			TierOrdinal: tiers.internLocked(entry.DeviceTier),
+		}
+	}
+	return records, nil
 }
