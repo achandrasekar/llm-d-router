@@ -31,6 +31,7 @@ import (
 // prefix cached.
 type indexerInterface interface {
 	Get(hash blockHash) podSet
+	MatchLongestPrefix(hashes []blockHash) map[ServerID]int
 	Add(hashes []blockHash, server server)
 	RemovePod(server ServerID)
 	Pods() []ServerID

@@ -19,6 +19,7 @@ package approximateprefix
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -152,6 +153,94 @@ func TestIndexer_ConcurrentAddRemovePod(t *testing.T) {
 			for hash, pods := range i.hashToPods {
 				assert.NotContains(t, pods, pod.ServerID, "iter %d: hashToPods[%v] references removed pod", iter, hash)
 			}
+		}
+	}
+}
+
+func TestIndexer_MatchLongestPrefix_CompressionAndEviction(t *testing.T) {
+	i := newIndexer(context.Background(), 100, "test-name", "test-type").(*indexer)
+
+	s1 := server{ServerID: ServerID{Namespace: "default", Name: "s1"}, NumOfGPUBlocks: 100}
+	s2 := server{ServerID: ServerID{Namespace: "default", Name: "s2"}, NumOfGPUBlocks: 100}
+	s3 := server{ServerID: ServerID{Namespace: "default", Name: "s3"}, NumOfGPUBlocks: 4}
+
+	branchA := []blockHash{10, 11, 12, 13, 14, 15}
+	branchB := []blockHash{10, 11, 12, 20, 21, 22}
+
+	i.Add(branchA, s1)
+	i.Add(branchB, s2)
+	i.Add(branchA, s3) // s3 has capacity 4, so only head [10, 11, 12, 13] survive
+
+	resA := i.MatchLongestPrefix(branchA)
+	assert.Equal(t, 6, resA[s1.ServerID])
+	assert.Equal(t, 3, resA[s2.ServerID])
+	assert.Equal(t, 4, resA[s3.ServerID])
+
+	resB := i.MatchLongestPrefix(branchB)
+	assert.Equal(t, 3, resB[s1.ServerID])
+	assert.Equal(t, 6, resB[s2.ServerID])
+	assert.Equal(t, 3, resB[s3.ServerID])
+
+	i.RemovePod(s1.ServerID)
+	resAfterRemove := i.MatchLongestPrefix(branchA)
+	assert.NotContains(t, resAfterRemove, s1.ServerID)
+	assert.Equal(t, 3, resAfterRemove[s2.ServerID])
+	assert.Equal(t, 4, resAfterRemove[s3.ServerID])
+}
+
+func legacyMatchLongestPrefix(idx indexerInterface, hashes []blockHash) map[ServerID]int {
+	res := make(map[ServerID]int)
+	for _, hash := range hashes {
+		cachedServers := idx.Get(hash)
+		if len(cachedServers) == 0 {
+			break
+		}
+		for server := range cachedServers {
+			res[server]++
+		}
+	}
+	return res
+}
+
+func BenchmarkApproximatePrefixMatchLongestPrefix(b *testing.B) {
+	for _, numBlocks := range []int{31, 63, 500, 2048} {
+		for _, numPods := range []int{4, 8, 96} {
+			name := fmt.Sprintf("blocks=%d/pods=%d", numBlocks, numPods)
+			hashes := make([]blockHash, numBlocks)
+			for j := range hashes {
+				hashes[j] = blockHash(uint64(j) + 1)
+			}
+
+			idx := newIndexer(context.Background(), numBlocks*2, "bench", "bench")
+			for p := 0; p < numPods; p++ {
+				srv := server{
+					ServerID:       ServerID{Namespace: "default", Name: fmt.Sprintf("pod-%d", p)},
+					NumOfGPUBlocks: numBlocks * 2,
+				}
+				idx.Add(hashes, srv)
+			}
+
+			b.Run("LegacyGetLoop/"+name, func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for k := 0; k < b.N; k++ {
+					res := legacyMatchLongestPrefix(idx, hashes)
+					if len(res) != numPods {
+						b.Fatalf("expected %d pods, got %d", numPods, len(res))
+					}
+				}
+			})
+
+			b.Run("RadixMatchLongestPrefix/"+name, func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for k := 0; k < b.N; k++ {
+					res := idx.MatchLongestPrefix(hashes)
+					if len(res) != numPods {
+						b.Fatalf("expected %d pods, got %d", numPods, len(res))
+					}
+				}
+			})
 		}
 	}
 }

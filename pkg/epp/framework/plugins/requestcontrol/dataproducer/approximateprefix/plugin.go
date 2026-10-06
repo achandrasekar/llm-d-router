@@ -328,6 +328,9 @@ func (p *dataProducer) makeserver(targetEndpoint fwksched.Endpoint) server {
 // matchLongestPrefix returns a map of servers and length of prefix that each server caches, prefix length is defined in blocks.
 func (p *dataProducer) matchLongestPrefix(ctx context.Context, hashes []blockHash) map[ServerID]int {
 	loggerTrace := log.FromContext(ctx).V(logutil.TRACE)
+	if !loggerTrace.Enabled() {
+		return p.indexerInst.MatchLongestPrefix(hashes)
+	}
 	res := make(map[ServerID]int)
 
 	// Use a greedy strategy to search from the longest prefix.
