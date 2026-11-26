@@ -1806,3 +1806,73 @@ func TestWideEPScenarios(t *testing.T) {
 		require.Contains(t, err.Error(), "dp-size-local")
 	})
 }
+
+func TestModelServerHostConfiguration(t *testing.T) {
+	t.Run("default localhost", func(t *testing.T) {
+		opts := NewOptions()
+		opts.modelServerPort = "7200"
+		require.NoError(t, opts.Complete())
+		require.NoError(t, opts.Validate())
+		require.Equal(t, "http://localhost:7200", opts.DecoderURL.String())
+	})
+
+	t.Run("custom remote host via flag and YAML", func(t *testing.T) {
+		opts := NewOptions()
+		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+		opts.AddFlags(fs)
+		require.NoError(t, fs.Parse([]string{"--model-server-host=10.42.0.15", "--model-server-port=7200", "--data-parallel-size=4"}))
+		require.NoError(t, opts.Complete())
+		require.NoError(t, opts.Validate())
+		require.Equal(t, "http://10.42.0.15:7200", opts.DecoderURL.String())
+	})
+
+	t.Run("rejects path or query injection in model-server-host", func(t *testing.T) {
+		opts := NewOptions()
+		opts.modelServerHost = "10.42.0.15/evil"
+		opts.modelServerPort = "7200"
+		require.NoError(t, opts.Complete())
+		err := opts.Validate()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "--model-server-host")
+	})
+
+	t.Run("injects dst-tp-size and dst-dcp-size into NIXLv2 prefill kv_transfer_params", func(t *testing.T) {
+		opts := NewOptions()
+		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+		opts.AddFlags(fs)
+		require.NoError(t, fs.Parse([]string{"--dst-tp-size=8", "--dst-dcp-size=4", "--model-server-port=7200"}))
+		require.NoError(t, opts.Complete())
+		require.NoError(t, opts.Validate())
+		srv := NewProxy(opts.Config)
+		pkv := srv.buildNIXLV2SerialPrefillKVParams(t.Context(), "req-1", 0, nil)
+		require.Equal(t, 8, pkv["dst_tp_size"])
+		require.Equal(t, 4, pkv["dst_dcp_size"])
+		// Clones for multi-rank DP sidecars preserve geometry.
+		cloned := srv.Clone()
+		pkv2 := cloned.buildNIXLV2SerialPrefillKVParams(t.Context(), "req-2", 1, nil)
+		require.Equal(t, 8, pkv2["dst_tp_size"])
+		require.Equal(t, 4, pkv2["dst_dcp_size"])
+	})
+
+	t.Run("omits dst-tp-size and dst-dcp-size when unset and rejects invalid geometry", func(t *testing.T) {
+		opts := NewOptions()
+		opts.modelServerPort = "7200"
+		require.NoError(t, opts.Complete())
+		require.NoError(t, opts.Validate())
+		srv := NewProxy(opts.Config)
+		pkv := srv.buildNIXLV2SerialPrefillKVParams(t.Context(), "req-default", 0, nil)
+		_, hasTP := pkv["dst_tp_size"]
+		_, hasDCP := pkv["dst_dcp_size"]
+		require.False(t, hasTP)
+		require.False(t, hasDCP)
+
+		bad := NewOptions()
+		bad.DstTPSize = 6
+		bad.DstDCPSize = 4
+		bad.modelServerPort = "7200"
+		require.NoError(t, bad.Complete())
+		err := bad.Validate()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "divisible")
+	})
+}

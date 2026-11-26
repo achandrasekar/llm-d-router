@@ -952,6 +952,12 @@ func (s *Server) buildNIXLV2SerialPrefillKVParams(ctx context.Context, uuidStr s
 			reqcommon.FieldRemotePort:      nil,
 		}
 	}
+	if s.config.DstTPSize > 0 {
+		pkv["dst_tp_size"] = s.config.DstTPSize
+	}
+	if s.config.DstDCPSize > 0 {
+		pkv["dst_dcp_size"] = s.config.DstDCPSize
+	}
 	addP2PPullToPrefill(pkv, source)
 	return pkv
 }

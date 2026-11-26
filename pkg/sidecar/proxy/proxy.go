@@ -65,6 +65,12 @@ type Config struct {
 	ECConnector string
 	// DataParallelSize is the value passed to the vLLM server's --DATA_PARALLEL-SIZE argument.
 	DataParallelSize int
+	// DstTPSize, when > 0, injects "dst_tp_size" into NIXLv2 prefill kv_transfer_params
+	// so a shared prefill pool can lower per-request KV spans for heterogeneous decode topologies.
+	DstTPSize int
+	// DstDCPSize, when > 0, injects "dst_dcp_size" into NIXLv2 prefill kv_transfer_params
+	// for heterogeneous decode context-parallel topologies.
+	DstDCPSize int
 
 	// MaxIdleConnsPerHost controls how many idle keep-alive connections are
 	// maintained per host for the reverse proxy transports. Set this to at

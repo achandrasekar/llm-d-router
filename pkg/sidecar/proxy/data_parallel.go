@@ -71,6 +71,10 @@ func (s *Server) startDataParallel(ctx context.Context, grp *errgroup.Group) err
 		return err
 	}
 	decoderScheme := s.config.DecoderURL.Scheme // capture before goroutines launch
+	decoderHost := s.config.DecoderURL.Hostname()
+	if decoderHost == "" {
+		decoderHost = "localhost"
+	}
 	s.dataParallelProxies[net.JoinHostPort(podIP, s.config.Port)] = s.decoderProxy
 
 	// Fill in map of proxies, thus avoiding locks
@@ -78,7 +82,7 @@ func (s *Server) startDataParallel(ctx context.Context, grp *errgroup.Group) err
 		decoderPort := strconv.Itoa(baseDecoderPort + idx + 1)
 		rankPort := strconv.Itoa(basePort + idx + 1)
 		hostPort := net.JoinHostPort(podIP, rankPort)
-		decoderURL, err := url.Parse(decoderScheme + "://localhost:" + decoderPort)
+		decoderURL, err := url.Parse(decoderScheme + "://" + net.JoinHostPort(decoderHost, decoderPort))
 		if err != nil {
 			return err
 		}
@@ -89,7 +93,7 @@ func (s *Server) startDataParallel(ctx context.Context, grp *errgroup.Group) err
 	for idx := range s.config.DataParallelSize - 1 {
 		rankPort := strconv.Itoa(basePort + idx + 1)
 		decoderPort := strconv.Itoa(baseDecoderPort + idx + 1)
-		decoderURL, err := url.Parse(decoderScheme + "://localhost:" + decoderPort)
+		decoderURL, err := url.Parse(decoderScheme + "://" + net.JoinHostPort(decoderHost, decoderPort))
 		if err != nil {
 			return err
 		}

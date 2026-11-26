@@ -56,8 +56,11 @@ const (
 
 	// Flags
 	port                      = "port"
+	modelServerHost           = "model-server-host"
 	modelServerPort           = "model-server-port"
 	dataParallelSize          = "data-parallel-size"
+	dstTPSizeFlag             = "dst-tp-size"
+	dstDCPSizeFlag            = "dst-dcp-size"
 	kvConnector               = "kv-connector"
 	ecConnector               = "ec-connector"
 	mooncakeBootstrapPortFlag = "mooncake-bootstrap-port"
@@ -95,6 +98,7 @@ const (
 
 	// Defaults
 	defaultPort                  = "8000"
+	defaultModelServerHost       = "localhost"
 	defaultModelServerPort       = "8200"
 	defaultDataParallelSize      = 1
 	defaultMooncakeBootstrapPort = 8998
@@ -117,11 +121,14 @@ const (
 // yamlConfiguration represents structure of YAML configuration for sidecar proxy
 type yamlConfiguration struct {
 	Port                       int      `json:"port,omitempty"`
+	ModelServerHost            string   `json:"model-server-host,omitempty"`
 	ModelServerPort            int      `json:"model-server-port,omitempty"`
 	MooncakeBootstrapPort      int      `json:"mooncake-bootstrap-port,omitempty"`
 	ECMooncakePort             int      `json:"ec-mooncake-port,omitempty"`
 	ECMooncakePodIP            string   `json:"ec-mooncake-pod-ip,omitempty"`
 	DataParallelSize           int      `json:"data-parallel-size,omitempty"`
+	DstTPSize                  int      `json:"dst-tp-size,omitempty"`
+	DstDCPSize                 int      `json:"dst-dcp-size,omitempty"`
 	KVConnector                string   `json:"kv-connector,omitempty"`
 	ECConnector                string   `json:"ec-connector,omitempty"`
 	EnableSSRFProtection       *bool    `json:"enable-ssrf-protection,omitempty"`
@@ -156,6 +163,8 @@ type Options struct {
 	// Fields with direct CLI flags are bound here via embedding; derived fields are set in Complete().
 	Config
 
+	// modelServerHost is the hostname or IP the model server is listening on; defaults to localhost.
+	modelServerHost string
 	// modelServerPort is the port the model server (vLLM, SGLang, etc.) is listening on; used to compute Config.DecoderURL in Complete().
 	modelServerPort string
 	// enableTLS is the list of stages to enable TLS for; used to compute Config.UseTLSFor* in Complete().
@@ -258,6 +267,7 @@ func NewOptions() *Options {
 			MoRIIODPSizeLocal: 0,
 			MoRIIODecodeHosts: nil,
 		},
+		modelServerHost: defaultModelServerHost,
 		modelServerPort: defaultModelServerPort,
 		inferencePool:   os.Getenv(envInferencePool),
 	}
@@ -275,9 +285,13 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	// Add Go flags to pflag (for zap options compatibility)
 	fs.AddGoFlagSet(goFlagSet)
 	fs.StringVar(&opts.Port, port, opts.Port, "the port the sidecar is listening on")
+	fs.StringVar(&opts.modelServerHost, modelServerHost, opts.modelServerHost,
+		fmt.Sprintf("the hostname or IP the model server is listening on (default %s)", defaultModelServerHost))
 	fs.StringVar(&opts.modelServerPort, modelServerPort, opts.modelServerPort,
 		fmt.Sprintf("the port the model server is listening on (default %s)", defaultModelServerPort))
 	fs.IntVar(&opts.DataParallelSize, dataParallelSize, opts.DataParallelSize, "the model server's data-parallel size")
+	fs.IntVar(&opts.DstTPSize, dstTPSizeFlag, opts.DstTPSize, "optional destination decode tensor-parallel size injected into NIXLv2 prefill kv_transfer_params when > 0")
+	fs.IntVar(&opts.DstDCPSize, dstDCPSizeFlag, opts.DstDCPSize, "optional destination decode context-parallel size injected into NIXLv2 prefill kv_transfer_params when > 0")
 	fs.StringVar(&opts.KVConnector, kvConnector, opts.KVConnector,
 		"the KV protocol between prefiller and decoder. Supported: "+supportedKVConnectorNamesStr)
 	fs.StringVar(&opts.ECConnector, ecConnector, opts.ECConnector,
@@ -420,12 +434,17 @@ func (opts *Options) Complete() error {
 	}
 	opts.TLSCipherSuites = suites
 
-	// Compute Config.DecoderURL from modelServerPort and decoder TLS setting
+	// Compute Config.DecoderURL from modelServerHost, modelServerPort and decoder TLS setting
 	scheme := "http"
 	if opts.UseTLSForDecoder {
 		scheme = schemeHTTPS
 	}
-	opts.DecoderURL, err = url.Parse(scheme + "://localhost:" + opts.modelServerPort)
+	host := strings.TrimSpace(opts.modelServerHost)
+	if host == "" {
+		host = defaultModelServerHost
+	}
+	opts.modelServerHost = host
+	opts.DecoderURL, err = url.Parse(scheme + "://" + net.JoinHostPort(host, opts.modelServerPort))
 	if err != nil {
 		return fmt.Errorf("failed to parse target URL: %w", err)
 	}
@@ -606,6 +625,15 @@ func (opts *Options) Validate() error {
 	if opts.DataParallelSize < 1 {
 		return fmt.Errorf("--data-parallel-size must be a positive integer, got %d", opts.DataParallelSize)
 	}
+	if opts.DstTPSize < 0 {
+		return fmt.Errorf("--dst-tp-size must be non-negative, got %d", opts.DstTPSize)
+	}
+	if opts.DstDCPSize < 0 {
+		return fmt.Errorf("--dst-dcp-size must be non-negative, got %d", opts.DstDCPSize)
+	}
+	if opts.DstTPSize > 0 && opts.DstDCPSize > 0 && opts.DstTPSize%opts.DstDCPSize != 0 {
+		return fmt.Errorf("--dst-tp-size (%d) must be divisible by --dst-dcp-size (%d)", opts.DstTPSize, opts.DstDCPSize)
+	}
 
 	port, err := strconv.Atoi(opts.Port)
 	if err != nil {
@@ -613,6 +641,10 @@ func (opts *Options) Validate() error {
 	}
 	if err := validatePortRange(port, opts.DataParallelSize); err != nil {
 		return fmt.Errorf("--port %w", err)
+	}
+
+	if strings.ContainsAny(opts.modelServerHost, " \t\r\n/?#@\\") {
+		return fmt.Errorf("--%s must be a bare hostname or IP literal, got %q", modelServerHost, opts.modelServerHost)
 	}
 
 	portFlagName := "--" + modelServerPort
@@ -769,6 +801,9 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 	if cfg.Port != 0 && !opts.isFlagSet(port) {
 		opts.Port = strconv.Itoa(cfg.Port)
 	}
+	if cfg.ModelServerHost != "" && !opts.isFlagSet(modelServerHost) {
+		opts.modelServerHost = cfg.ModelServerHost
+	}
 	if cfg.ModelServerPort != 0 && !opts.isFlagSet(modelServerPort) {
 		opts.modelServerPort = strconv.Itoa(cfg.ModelServerPort)
 	}
@@ -783,6 +818,12 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 	}
 	if cfg.DataParallelSize != 0 && !opts.isFlagSet(dataParallelSize) {
 		opts.DataParallelSize = cfg.DataParallelSize
+	}
+	if cfg.DstTPSize != 0 && !opts.isFlagSet(dstTPSizeFlag) {
+		opts.DstTPSize = cfg.DstTPSize
+	}
+	if cfg.DstDCPSize != 0 && !opts.isFlagSet(dstDCPSizeFlag) {
+		opts.DstDCPSize = cfg.DstDCPSize
 	}
 	if cfg.MaxIdleConnsPerHost != 0 && !opts.isFlagSet(maxIdleConnsPerHost) {
 		opts.MaxIdleConnsPerHost = cfg.MaxIdleConnsPerHost
